@@ -1,8 +1,10 @@
 import os
 import textwrap
 import hashlib
+import asyncio
 from datetime import datetime
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
+from functools import lru_cache
 
 import streamlit as st
 from dotenv import load_dotenv
@@ -11,15 +13,20 @@ import fitz  # PyMuPDF
 import numpy as np
 from sentence_transformers import SentenceTransformer
 import faiss
+from tqdm import tqdm
 
 # -----------------------
 # Configuration
 # -----------------------
-# Load local .env (works locally). When deployed to Streamlit Cloud,
-# set GEMINI_API_KEY in the app's environment variables (not shown in UI).
-load_dotenv()
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", None)
+# Load environment variables safely
+try:
+    load_dotenv()
+    GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+except Exception as e:
+    st.error(f"Environment configuration error: {str(e)}")
+    GEMINI_API_KEY = None
 
+# Configure Streamlit
 st.set_page_config(
     page_title="DocuSense — AI Document Analysis",
     page_icon="📚",
@@ -30,185 +37,255 @@ st.set_page_config(
 # -----------------------
 # Utilities
 # -----------------------
+@lru_cache(maxsize=1024)
 def hash_text(s: str) -> str:
     return hashlib.sha1(s.encode("utf-8")).hexdigest()[:10]
 
 def chunk_text(text: str, chunk_size: int = 700, overlap: int = 100) -> List[str]:
-    """Enhanced text chunker with improved paragraph handling"""
-    text = text.replace("\r\n", "\n")
+    """Improved text chunker with better paragraph handling and overlap management"""
+    text = text.replace("\r\n", "\n").strip()
+    if not text:
+        return []
+    
     paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
+    if not paragraphs:
+        return []
+    
     chunks = []
-    current_chunk = ""
+    current_chunk = []
+    current_length = 0
     
     for para in paragraphs:
-        if len(current_chunk) + len(para) + 2 <= chunk_size:
-            current_chunk += ("\n\n" + para) if current_chunk else para
-        else:
-            if current_chunk:
-                chunks.append(current_chunk)
-            current_chunk = para
+        para_words = para.split()
+        for word in para_words:
+            word_len = len(word) + 1  # +1 for space
+            
+            if current_length + word_len > chunk_size:
+                if current_chunk:
+                    chunks.append(' '.join(current_chunk))
+                
+                # Handle overlap
+                if overlap > 0 and len(current_chunk) > overlap:
+                    current_chunk = current_chunk[-overlap:]
+                    current_length = sum(len(w) + 1 for w in current_chunk)
+                else:
+                    current_chunk = []
+                    current_length = 0
+                
+            current_chunk.append(word)
+            current_length += word_len
     
     if current_chunk:
-        chunks.append(current_chunk)
+        chunks.append(' '.join(current_chunk))
     
-    final_chunks = []
-    for chunk in chunks:
-        if len(chunk) <= chunk_size:
-            final_chunks.append(chunk)
-        else:
-            words = chunk.split()
-            current = []
-            for word in words:
-                # allow overlap to be preserved when splitting long chunk
-                if len(' '.join(current + [word])) <= chunk_size - overlap:
-                    current.append(word)
-                else:
-                    final_chunks.append(' '.join(current))
-                    # keep last `overlap` words for continuity (or empty)
-                    if overlap > 0:
-                        current = current[-overlap:] + [word]
-                    else:
-                        current = [word]
-            if current:
-                final_chunks.append(' '.join(current))
-    
-    return final_chunks
+    return chunks
 
 def extract_text_from_pdf_bytes(pdf_bytes: bytes) -> List[Tuple[int, str]]:
-    """Extract text from PDF with improved formatting"""
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    pages = []
-    for i in range(len(doc)):
-        blocks = doc[i].get_text("blocks")
-        page_text = []
-        for block in blocks:
-            # block[4] contains text portion in "blocks" output
-            if block[4].strip():
-                page_text.append(block[4].strip())
-        pages.append((i + 1, "\n".join(page_text)))
-    return pages
+    """Robust PDF text extraction with fallback methods"""
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        pages = []
+        
+        for page_num in range(len(doc)):
+            page = doc[page_num]
+            
+            # Try regular text extraction first
+            text = page.get_text("text").strip()
+            
+            # Fallback to blocks if no text found
+            if not text:
+                blocks = page.get_text("blocks")
+                text = "\n".join([b[4].strip() for b in blocks if b[4].strip()])
+            
+            if text:
+                pages.append((page_num + 1, text))
+        
+        return pages
+    
+    except Exception as e:
+        st.error(f"PDF processing error: {str(e)}")
+        return []
 
 # -----------------------
-# DocumentStore
+# DocumentStore with Improved Performance
 # -----------------------
 class DocumentStore:
     def __init__(self, model_name: str = "all-MiniLM-L6-v2"):
         self.model_name = model_name
-        self.embedder = SentenceTransformer(model_name)
+        self.embedder = self._get_embedder(model_name)
         self.dim = self.embedder.get_sentence_embedding_dimension()
         self.texts: List[str] = []
         self.metadata: List[Dict] = []
-        self.embeddings: np.ndarray = None
+        self.embeddings: Optional[np.ndarray] = None
         self.index = None
-
-    def add_documents(self, docs: List[Dict]):
+        self.is_trained = False
+    
+    @staticmethod
+    @lru_cache(maxsize=1)
+    def _get_embedder(model_name: str):
+        """Cached embedder to avoid repeated loading"""
+        return SentenceTransformer(model_name)
+    
+    async def add_documents_async(self, docs: List[Dict]):
+        """Asynchronous document processing"""
         if not docs:
             return
-            
+        
         new_texts = [d["text"] for d in docs]
         new_meta = [{k: v for k, v in d.items() if k != "text"} for d in docs]
-
-        progress_text = st.empty()
-        progress_bar = st.progress(0)
         
+        # Process embeddings in batches
         batch_size = 32
         all_embs = []
-        try:
-            for i in range(0, len(new_texts), batch_size):
-                batch = new_texts[i:i + batch_size]
-                progress = (i + len(batch)) / len(new_texts)
-                progress_text.text(f"Processing documents... {progress:.0%}")
-                progress_bar.progress(progress)
-                # encode to numpy arrays
-                embs = self.embedder.encode(batch, convert_to_numpy=True, show_progress_bar=False)
-                all_embs.append(embs)
-        except Exception as e:
-            progress_text.empty()
-            progress_bar.empty()
-            st.error(f"Embedding error: {e}")
-            return
+        
+        with st.spinner("Processing documents..."):
+            progress_bar = st.progress(0)
+            
+            try:
+                for i in range(0, len(new_texts), batch_size):
+                    batch = new_texts[i:i + batch_size]
+                    progress = min((i + len(batch)) / len(new_texts), 1.0)
+                    progress_bar.progress(progress)
+                    
+                    # Process batch asynchronously
+                    embs = await asyncio.to_thread(
+                        self.embedder.encode, 
+                        batch, 
+                        convert_to_numpy=True, 
+                        show_progress_bar=False
+                    )
+                    all_embs.append(embs)
+                    
+            except Exception as e:
+                st.error(f"Embedding error: {e}")
+                return
+            finally:
+                progress_bar.empty()
         
         embs = np.vstack(all_embs).astype("float32")
-        progress_text.empty()
-        progress_bar.empty()
-
+        
+        # Update storage
+        self.texts.extend(new_texts)
+        self.metadata.extend(new_meta)
+        
+        # Initialize or update index
         if self.embeddings is None:
             self.embeddings = embs
         else:
             self.embeddings = np.vstack([self.embeddings, embs])
-
-        self.texts.extend(new_texts)
-        self.metadata.extend(new_meta)
-
-        # normalize embeddings then build or update index
+        
+        # Normalize and index
         faiss.normalize_L2(self.embeddings)
+        self._build_or_update_index(embs)
+    
+    def _build_or_update_index(self, new_embs: np.ndarray):
+        """Efficient index management"""
         try:
             if self.index is None:
-                # choose nlist safely
-                nlist = min(100, max(1, len(self.texts)))
+                nlist = min(100, max(1, len(self.texts) // 100))
                 quantizer = faiss.IndexFlatIP(self.dim)
                 self.index = faiss.IndexIVFFlat(quantizer, self.dim, nlist)
-                if len(self.texts) > 0:
-                    # train only once with many vectors
+                
+                if len(self.texts) >= nlist * 5:  # Minimum training samples
                     self.index.train(self.embeddings)
-            if len(self.texts) > 0:
-                self.index.add(embs)
-        except Exception as e:
-            st.error(f"FAISS index error: {e}")
-
-    def query(self, q: str, top_k: int = 5):
-        if not self.index or self.embeddings is None or not self.texts:
-            return []
+                    self.is_trained = True
             
-        q_emb = self.embedder.encode([q], convert_to_numpy=True).astype("float32")
-        faiss.normalize_L2(q_emb)
+            if self.is_trained and len(new_embs) > 0:
+                self.index.add(new_embs)
+        
+        except Exception as e:
+            st.error(f"Index error: {e}")
+    
+    def query(self, q: str, top_k: int = 5, score_threshold: float = 0.3) -> List[Dict]:
+        """Improved search with query expansion and score thresholding"""
+        if not self.index or not self.is_trained or not self.texts:
+            return []
+        
+        # Simple query expansion
+        expanded_q = f"{q} {' '.join([w for w in q.split() if len(w) > 3][:3])}"
+        
         try:
-            D, I = self.index.search(q_emb, top_k)
+            q_emb = self.embedder.encode([expanded_q], convert_to_numpy=True).astype("float32")
+            faiss.normalize_L2(q_emb)
+            
+            # Get extra results to filter
+            D, I = self.index.search(q_emb, top_k * 3)
+            
+            results = []
+            for score, idx in zip(D[0], I[0]):
+                if idx >= 0 and idx < len(self.texts) and score >= score_threshold:
+                    results.append({
+                        "score": float(score),
+                        "text": self.texts[idx],
+                        "meta": self.metadata[idx],
+                    })
+            
+            # Sort and return top_k
+            results.sort(key=lambda x: x["score"], reverse=True)
+            return results[:top_k]
+        
         except Exception as e:
             st.error(f"Search error: {e}")
             return []
-        
-        results = []
-        for score, idx in zip(D[0], I[0]):
-            if idx >= 0 and idx < len(self.texts):
-                results.append({
-                    "score": float(score),
-                    "text": self.texts[idx],
-                    "meta": self.metadata[idx],
-                })
-        
-        # sort by score descending
-        results.sort(key=lambda x: x["score"], reverse=True)
-        return results
+    
+    def clear(self):
+        """Clean up resources"""
+        self.texts = []
+        self.metadata = []
+        self.embeddings = None
+        self.index = None
+        self.is_trained = False
+    
+    def get_stats(self) -> Dict:
+        return {
+            "documents": len(set(m["source"] for m in self.metadata)),
+            "chunks": len(self.texts),
+            "index_trained": self.is_trained
+        }
 
 # -----------------------
-# Session State Defaults
+# Session State Management
 # -----------------------
-if "store" not in st.session_state:
-    st.session_state.store = None
-if "uploaded_files" not in st.session_state:
-    st.session_state.uploaded_files = []
-if "history" not in st.session_state:
-    st.session_state.history = []
-# gemini_key is loaded from environment only (never via UI)
-if "gemini_key" not in st.session_state:
-    st.session_state.gemini_key = GEMINI_API_KEY
-if "page" not in st.session_state:
-    st.session_state.page = "Home"
-if "show_success" not in st.session_state:
-    st.session_state.show_success = False
-# theme_preferences used in some blocks (keep defaults; Dark by default)
-if "theme_preferences" not in st.session_state:
-    st.session_state.theme_preferences = {
-        "mode": "Dark",
-        "secondary_color": "#FF6B6B"
+def init_session_state():
+    """Initialize all session state variables"""
+    defaults = {
+        "store": None,
+        "uploaded_files": [],
+        "history": [],
+        "gemini_key": GEMINI_API_KEY,
+        "page": "Home",
+        "show_success": False,
+        "theme_preferences": {
+            "mode": "Dark",
+            "secondary_color": "#FF6B6B"
+        },
+        "processing": False
     }
+    
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+
+init_session_state()
 
 # -----------------------
-# STYLES (DARK THEME, HIGH CONTRAST)
+# UI Components
 # -----------------------
-st.markdown(
-    """
+def show_footer():
+    st.markdown(
+        """
+    <div class="ds-footer">
+        <div>Made with ❤️ by <a href="https://github.com/abdulrafay1402" target="_blank" style="color:#cfe8ff;">Abdul Rafay</a>
+         • <a href="mailto:abdulrafay14021997@gmail.com" style="color:#cfe8ff;">Email</a> • <a href="https://linkedin.com/in/abdulrafay-imran" target="_blank" style="color:#cfe8ff;">LinkedIn</a></div>
+        <small>© 2024-2025 Abdul Rafay. All rights reserved.</small>
+    </div>
+    """,
+        unsafe_allow_html=True,
+    )
+
+def setup_styles():
+    st.markdown(
+        """
     <style>
     /* App background and text */
     .stApp {
@@ -256,53 +333,38 @@ st.markdown(
         background-color: #ff6b6b !important;
         color: white !important;
     }
+    /* spinner color */
+    .stSpinner > div > div { border-top-color: #ff6b6b !important; }
     </style>
     """,
-    unsafe_allow_html=True,
-)
-
-# -----------------------
-# Sidebar Navigation (no settings panel for API key)
-# -----------------------
-with st.sidebar:
-    st.markdown(
-        "<div style='display:flex; align-items:center; gap:0.6rem;'>"
-        "<div style='font-size:26px'>📚</div>"
-        "<div><h2 style='margin:0;'>DocuSense</h2></div></div>",
-        unsafe_allow_html=True,
-    )
-    st.markdown("AI-powered document analysis")
-    st.markdown("---")
-
-    for p in ["Home", "Upload", "Search", "History"]:
-        if st.button(p, key=f"nav_{p.lower()}", use_container_width=True,
-                     type="primary" if p == st.session_state.page else "secondary"):
-            st.session_state.page = p
-            st.rerun()
-
-    st.markdown("---")
-    st.caption("Made with ❤️ by Abdul Rafay")
-    st.markdown("<small>Software Engineering student at FAST-NUCES, Karachi, Pakistan</small>", unsafe_allow_html=True)
-
-# -----------------------
-# Helper: footer HTML
-# -----------------------
-def show_footer():
-    st.markdown(
-        f"""
-    <div class="ds-footer">
-        <div>Made with ❤️ by <a href="https://github.com/abdulrafay1402" target="_blank" style="color:#cfe8ff;">Abdul Rafay</a>
-         • <a href="mailto:abdulrafay1402@gmail.com" style="color:#cfe8ff;">Email</a> • <a href="https://linkedin.com/in/abdulrafay1402" target="_blank" style="color:#cfe8ff;">LinkedIn</a></div>
-        <small>© 2024-2025 Abdul Rafay. All rights reserved.</small>
-    </div>
-    """,
         unsafe_allow_html=True,
     )
 
+def sidebar_navigation():
+    with st.sidebar:
+        st.markdown(
+            "<div style='display:flex; align-items:center; gap:0.6rem;'>"
+            "<div style='font-size:26px'>📚</div>"
+            "<div><h2 style='margin:0;'>DocuSense</h2></div></div>",
+            unsafe_allow_html=True,
+        )
+        st.markdown("AI-powered document analysis")
+        st.markdown("---")
+
+        for p in ["Home", "Upload", "Search", "History"]:
+            if st.button(p, key=f"nav_{p.lower()}", use_container_width=True,
+                         type="primary" if p == st.session_state.page else "secondary"):
+                st.session_state.page = p
+                st.rerun()
+
+        st.markdown("---")
+        st.caption("Made with ❤️ by Abdul Rafay")
+        st.markdown("<small>Software Engineering student at FAST-NUCES, Karachi, Pakistan</small>", unsafe_allow_html=True)
+
 # -----------------------
-# Pages
+# Page Handlers
 # -----------------------
-if st.session_state.page == "Home":
+def home_page():
     st.title("DocuSense")
     st.markdown("### AI-powered document understanding")
 
@@ -363,7 +425,7 @@ if st.session_state.page == "Home":
 
     show_footer()
 
-elif st.session_state.page == "Upload":
+async def upload_page():
     st.title("Upload Documents")
     st.markdown("Transform your PDFs into searchable knowledge")
 
@@ -394,10 +456,11 @@ elif st.session_state.page == "Upload":
         with col3:
             default_topk = st.number_input("Results to show", 1, 20, 5)
 
-    if uploaded_files:
+    if uploaded_files and not st.session_state.processing:
         st.success(f"📄 {len(uploaded_files)} file(s) ready to process")
 
         if st.button("🚀 Process Documents", type="primary", use_container_width=True):
+            st.session_state.processing = True
             docs_to_add = []
             progress_text = st.empty()
             progress_bar = st.progress(0)
@@ -431,18 +494,20 @@ elif st.session_state.page == "Upload":
                     if st.session_state.store is None:
                         st.session_state.store = DocumentStore()
 
-                    st.session_state.store.add_documents(docs_to_add)
+                    await st.session_state.store.add_documents_async(docs_to_add)
                     st.session_state.uploaded_files = list({d["source"] for d in docs_to_add})
 
                     progress_bar.progress(1.0)
                     st.session_state.show_success = True
-                    # rerun so success balloon appears in new state
+                    st.session_state.processing = False
                     st.rerun()
                 else:
                     st.warning("No text content found in the uploaded files")
+                    st.session_state.processing = False
 
             except Exception as e:
                 st.error(f"Error processing documents: {str(e)}")
+                st.session_state.processing = False
             finally:
                 progress_bar.empty()
                 progress_text.empty()
@@ -458,7 +523,7 @@ elif st.session_state.page == "Upload":
 
     show_footer()
 
-elif st.session_state.page == "Search":
+def search_page():
     st.title("Document Search")
     st.markdown("Ask questions about your documents")
 
@@ -507,20 +572,36 @@ elif st.session_state.page == "Search":
                             else:
                                 with st.spinner("Generating explanation..."):
                                     try:
-                                        # configure genai with user's key (never printed)
                                         genai.configure(api_key=st.session_state.gemini_key)
                                         model = genai.GenerativeModel("gemini-2.0-flash")
+                                        
+                                        # Truncate text if too long
+                                        max_context = 3000
+                                        context = r['text'][:max_context]
+                                        
                                         prompt = f"""
 Explain this passage in simpler terms and how it relates to the question: "{query}".
 Be concise (2-3 sentences max).
 
 PASSAGE (from {r['meta']['source']}, page {r['meta']['page']}):
-{r['text']}
+{context}
 """
-                                        response = model.generate_content(prompt)
-                                        # access text safely (depends on genai response)
-                                        explanation = getattr(response, "text", str(response))
-
+                                        response = model.generate_content(
+                                            prompt,
+                                            safety_settings={
+                                                'HARM_CATEGORY_HARASSMENT': 'BLOCK_NONE',
+                                                'HARM_CATEGORY_HATE_SPEECH': 'BLOCK_NONE',
+                                                'HARM_CATEGORY_SEXUALLY_EXPLICIT': 'BLOCK_NONE',
+                                                'HARM_CATEGORY_DANGEROUS_CONTENT': 'BLOCK_NONE'
+                                            },
+                                            request_options={'timeout': 10}
+                                        )
+                                        
+                                        if response and hasattr(response, 'text'):
+                                            explanation = response.text
+                                        else:
+                                            explanation = "Could not generate explanation (API response format unexpected)"
+                                        
                                         bg = "#071218"
                                         left_color = st.session_state.theme_preferences.get("secondary_color", "#FF6B6B")
                                         st.markdown(
@@ -552,7 +633,7 @@ PASSAGE (from {r['meta']['source']}, page {r['meta']['page']}):
 
     show_footer()
 
-elif st.session_state.page == "History":
+def history_page():
     st.title("Search History")
 
     if not st.session_state.history:
@@ -591,16 +672,38 @@ elif st.session_state.page == "History":
                 )
 
     # System info
-    with st.container():
-        st.markdown(
-            f"""
-        <div class="ds-card-light" style="margin-top:12px;">
-            <h3>📊 System Information</h3>
-            <p><b>Documents indexed:</b> {len(st.session_state.uploaded_files) if st.session_state.store else 0}</p>
-            <p><b>Text chunks:</b> {len(st.session_state.store.texts) if st.session_state.store else 0}</p>
-        </div>
-        """,
-            unsafe_allow_html=True,
-        )
+    if st.session_state.store:
+        stats = st.session_state.store.get_stats()
+        with st.container():
+            st.markdown(
+                f"""
+            <div class="ds-card-light" style="margin-top:12px;">
+                <h3>📊 System Information</h3>
+                <p><b>Documents indexed:</b> {stats['documents']}</p>
+                <p><b>Text chunks:</b> {stats['chunks']}</p>
+                <p><b>Index status:</b> {'Trained' if stats['index_trained'] else 'Not trained'}</p>
+            </div>
+            """,
+                unsafe_allow_html=True,
+            )
 
     show_footer()
+
+# -----------------------
+# Main App
+# -----------------------
+def main():
+    setup_styles()
+    sidebar_navigation()
+
+    if st.session_state.page == "Home":
+        home_page()
+    elif st.session_state.page == "Upload":
+        asyncio.run(upload_page())
+    elif st.session_state.page == "Search":
+        search_page()
+    elif st.session_state.page == "History":
+        history_page()
+
+if __name__ == "__main__":
+    main()
