@@ -22,6 +22,8 @@ from tqdm import tqdm
 try:
     load_dotenv()
     GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+    if not GEMINI_API_KEY:
+        GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY", None)
 except Exception as e:
     st.error(f"Environment configuration error: {str(e)}")
     GEMINI_API_KEY = None
@@ -106,6 +108,87 @@ def extract_text_from_pdf_bytes(pdf_bytes: bytes) -> List[Tuple[int, str]]:
         st.error(f"PDF processing error: {str(e)}")
         return []
 
+async def generate_summary(text: str, api_key: str) -> str:
+    """Generate document summary using Gemini API"""
+    if not api_key:
+        return "Summary unavailable: Gemini API key not configured"
+    
+    try:
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel("gemini-pro")
+        
+        # Truncate text if too long (Gemini has token limits)
+        max_context = 30000  # Conservative estimate
+        context = text[:max_context]
+        
+        prompt = f"""
+Please provide a concise summary (3-5 bullet points) of the following document content.
+Focus on key points, main arguments, and important findings.
+
+DOCUMENT CONTENT:
+{context}
+
+SUMMARY:
+"""
+        response = await asyncio.to_thread(
+            model.generate_content,
+            prompt,
+            safety_settings={
+                'HARM_CATEGORY_HARASSMENT': 'BLOCK_NONE',
+                'HARM_CATEGORY_HATE_SPEECH': 'BLOCK_NONE',
+                'HARM_CATEGORY_SEXUALLY_EXPLICIT': 'BLOCK_NONE',
+                'HARM_CATEGORY_DANGEROUS_CONTENT': 'BLOCK_NONE'
+            },
+            request_options={'timeout': 20}
+        )
+        
+        if response and hasattr(response, 'text'):
+            return response.text
+        return "Could not generate summary (API response format unexpected)"
+    
+    except Exception as e:
+        st.error(f"Summary generation error: {str(e)}")
+        return f"Summary unavailable: {str(e)}"
+
+async def generate_explanation(query: str, text: str, source: str, page: int, api_key: str) -> str:
+    """Generate explanation using Gemini API with improved error handling"""
+    if not api_key:
+        return "Explanation unavailable: Gemini API key not configured"
+    
+    try:
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel("gemini-pro")
+        
+        # Truncate text if too long
+        max_context = 10000  # Conservative estimate
+        context = text[:max_context]
+        
+        prompt = f"""
+Explain this passage in simpler terms and how it relates to the question: "{query}".
+Be concise (2-3 sentences max).
+
+PASSAGE (from {source}, page {page}):
+{context}
+"""
+        response = await asyncio.to_thread(
+            model.generate_content,
+            prompt,
+            safety_settings={
+                'HARM_CATEGORY_HARASSMENT': 'BLOCK_NONE',
+                'HARM_CATEGORY_HATE_SPEECH': 'BLOCK_NONE',
+                'HARM_CATEGORY_SEXUALLY_EXPLICIT': 'BLOCK_NONE',
+                'HARM_CATEGORY_DANGEROUS_CONTENT': 'BLOCK_NONE'
+            },
+            request_options={'timeout': 15}
+        )
+        
+        if response and hasattr(response, 'text'):
+            return response.text
+        return "Could not generate explanation (API response format unexpected)"
+    
+    except Exception as e:
+        return f"Explanation unavailable: {str(e)}"
+
 # -----------------------
 # DocumentStore with Improved Performance
 # -----------------------
@@ -119,6 +202,7 @@ class DocumentStore:
         self.embeddings: Optional[np.ndarray] = None
         self.index = None
         self.is_trained = False
+        self.full_texts: Dict[str, str] = {}  # Store full text by source for summarization
     
     @staticmethod
     @lru_cache(maxsize=1)
@@ -133,6 +217,12 @@ class DocumentStore:
         
         new_texts = [d["text"] for d in docs]
         new_meta = [{k: v for k, v in d.items() if k != "text"} for d in docs]
+        
+        # Store full texts by source for summarization
+        for doc in docs:
+            if doc["source"] not in self.full_texts:
+                self.full_texts[doc["source"]] = ""
+            self.full_texts[doc["source"]] += f"\n\n{doc['text']}"
         
         # Process embeddings in batches
         batch_size = 32
@@ -235,6 +325,7 @@ class DocumentStore:
         self.embeddings = None
         self.index = None
         self.is_trained = False
+        self.full_texts = {}
     
     def get_stats(self) -> Dict:
         return {
@@ -259,7 +350,8 @@ def init_session_state():
             "mode": "Dark",
             "secondary_color": "#FF6B6B"
         },
-        "processing": False
+        "processing": False,
+        "summaries": {}  # Store document summaries
     }
     
     for key, value in defaults.items():
@@ -335,6 +427,14 @@ def setup_styles():
     }
     /* spinner color */
     .stSpinner > div > div { border-top-color: #ff6b6b !important; }
+    /* summary box */
+    .summary-box {
+        background: #071218;
+        padding: 1rem;
+        border-radius: 8px;
+        margin: 1rem 0;
+        border-left: 4px solid #4CAF50;
+    }
     </style>
     """,
         unsafe_allow_html=True,
@@ -380,6 +480,7 @@ def home_page():
                 <li>🔍 Semantic search</li>
                 <li>🤖 AI explanations</li>
                 <li>📊 History tracking</li>
+                <li>📑 Document summarization</li>
             </ul>
         </div>
         """,
@@ -397,6 +498,7 @@ def home_page():
                 <li>Index & embed content</li>
                 <li>Ask natural language questions</li>
                 <li>Get concise AI explanations</li>
+                <li>Generate document summaries</li>
             </ol>
         </div>
         """,
@@ -523,7 +625,7 @@ async def upload_page():
 
     show_footer()
 
-def search_page():
+async def search_page():
     st.title("Document Search")
     st.markdown("Ask questions about your documents")
 
@@ -533,6 +635,39 @@ def search_page():
             st.session_state.page = "Upload"
             st.rerun()
     else:
+        # Document summary section
+        if hasattr(st.session_state.store, 'full_texts') and st.session_state.store.full_texts:
+            with st.expander("📑 Document Summaries", expanded=True):
+                for source, text in st.session_state.store.full_texts.items():
+                    if source not in st.session_state.summaries:
+                        if st.button(f"Generate Summary for {source}", key=f"summarize_{source}"):
+                            with st.spinner(f"Generating summary for {source}..."):
+                                summary = await generate_summary(
+                                    text,
+                                    st.session_state.gemini_key
+                                )
+                                st.session_state.summaries[source] = summary
+                                st.rerun()
+                    else:
+                        st.markdown(
+                            f"""
+                            <div class="summary-box">
+                                <h4>{source}</h4>
+                                <p>{st.session_state.summaries[source]}</p>
+                            </div>
+                            """,
+                            unsafe_allow_html=True
+                        )
+                        if st.button(f"Regenerate Summary for {source}", key=f"regenerate_{source}"):
+                            with st.spinner(f"Regenerating summary for {source}..."):
+                                summary = await generate_summary(
+                                    text,
+                                    st.session_state.gemini_key
+                                )
+                                st.session_state.summaries[source] = summary
+                                st.rerun()
+
+        # Search functionality
         with st.form("search_form"):
             query = st.text_input("Your question", placeholder="What would you like to know?", label_visibility="collapsed")
 
@@ -571,59 +706,34 @@ def search_page():
                                 st.error("⚠️ Gemini API key not set. Set GEMINI_API_KEY in environment variables.")
                             else:
                                 with st.spinner("Generating explanation..."):
-                                    try:
-                                        genai.configure(api_key=st.session_state.gemini_key)
-                                        model = genai.GenerativeModel("gemini-2.0-flash")
-                                        
-                                        # Truncate text if too long
-                                        max_context = 3000
-                                        context = r['text'][:max_context]
-                                        
-                                        prompt = f"""
-Explain this passage in simpler terms and how it relates to the question: "{query}".
-Be concise (2-3 sentences max).
+                                    explanation = await generate_explanation(
+                                        query,
+                                        r['text'],
+                                        r['meta']['source'],
+                                        r['meta']['page'],
+                                        st.session_state.gemini_key
+                                    )
+                                    
+                                    bg = "#071218"
+                                    left_color = st.session_state.theme_preferences.get("secondary_color", "#FF6B6B")
+                                    st.markdown(
+                                        f"""
+                                    <div style="background: {bg}; padding: 1rem; border-radius: 8px; margin-top: 0.5rem; border-left: 4px solid {left_color}">
+                                        <p style="margin:0; color:#dfeefc;"><b>🤖 AI Explanation:</b> {explanation}</p>
+                                    </div>
+                                    """,
+                                        unsafe_allow_html=True,
+                                    )
 
-PASSAGE (from {r['meta']['source']}, page {r['meta']['page']}):
-{context}
-"""
-                                        response = model.generate_content(
-                                            prompt,
-                                            safety_settings={
-                                                'HARM_CATEGORY_HARASSMENT': 'BLOCK_NONE',
-                                                'HARM_CATEGORY_HATE_SPEECH': 'BLOCK_NONE',
-                                                'HARM_CATEGORY_SEXUALLY_EXPLICIT': 'BLOCK_NONE',
-                                                'HARM_CATEGORY_DANGEROUS_CONTENT': 'BLOCK_NONE'
-                                            },
-                                            request_options={'timeout': 10}
-                                        )
-                                        
-                                        if response and hasattr(response, 'text'):
-                                            explanation = response.text
-                                        else:
-                                            explanation = "Could not generate explanation (API response format unexpected)"
-                                        
-                                        bg = "#071218"
-                                        left_color = st.session_state.theme_preferences.get("secondary_color", "#FF6B6B")
-                                        st.markdown(
-                                            f"""
-                                        <div style="background: {bg}; padding: 1rem; border-radius: 8px; margin-top: 0.5rem; border-left: 4px solid {left_color}">
-                                            <p style="margin:0; color:#dfeefc;"><b>🤖 AI Explanation:</b> {explanation}</p>
-                                        </div>
-                                        """,
-                                            unsafe_allow_html=True,
-                                        )
-
-                                        # Save to history
-                                        st.session_state.history.append(
-                                            {
-                                                "query": query,
-                                                "result": r,
-                                                "explanation": explanation,
-                                                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M"),
-                                            }
-                                        )
-                                    except Exception as e:
-                                        st.error(f"Error generating explanation: {str(e)}")
+                                    # Save to history
+                                    st.session_state.history.append(
+                                        {
+                                            "query": query,
+                                            "result": r,
+                                            "explanation": explanation,
+                                            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                                        }
+                                    )
 
                 # Navigation
                 st.markdown("---")
@@ -701,7 +811,7 @@ def main():
     elif st.session_state.page == "Upload":
         asyncio.run(upload_page())
     elif st.session_state.page == "Search":
-        search_page()
+        asyncio.run(search_page())
     elif st.session_state.page == "History":
         history_page()
 
