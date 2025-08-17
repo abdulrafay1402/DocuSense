@@ -99,8 +99,8 @@ def extract_text_from_pdf_bytes(pdf_bytes: bytes) -> List[Tuple[int, str]]:
         st.error(f"PDF processing error: {str(e)}")
         return []
 
-async def generate_explanation(query: str, text: str, source: str, page: int, api_key: str) -> str:
-    """Generate explanation using Gemini API, scoped ONLY to the selected passage (chunk)."""
+def generate_explanation_sync(query: str, text: str, source: str, page: int, api_key: str) -> str:
+    """Generate explanation using Gemini API - SYNCHRONOUS version for better Streamlit compatibility"""
     if not api_key:
         return "Explanation unavailable: Gemini API key not configured"
     try:
@@ -115,9 +115,7 @@ Write 2–3 short sentences. Stay strictly within this passage; do not invent de
 PASSAGE (from {source}, page {page}):
 {context}
 """
-        # Run the blocking call off-thread
-        response = await asyncio.to_thread(
-            model.generate_content,
+        response = model.generate_content(
             prompt,
             safety_settings={
                 'HARM_CATEGORY_HARASSMENT': 'BLOCK_NONE',
@@ -249,6 +247,8 @@ def init_session_state():
         "page": "Home",
         "processing": False,
         "default_topk": 5,
+        "processing_complete": False,  # NEW: Track if processing just completed
+        "explaining_result": None,  # NEW: Track which result is being explained
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -436,11 +436,31 @@ async def upload_page():
                 "Results to show", 1, 20, st.session_state.default_topk
             )
 
-    # ---------- IMPORTANT: all processing stays inside the function ----------
-    if uploaded_files and not st.session_state.processing:
+    # FIX 1: Check if processing just completed and show navigation button
+    if st.session_state.processing_complete:
+        st.success("✅ Documents processed successfully!")
+        st.markdown(
+            '<div class="success-badge">Index ready. You can now search your documents.</div>',
+            unsafe_allow_html=True,
+        )
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("🔍 Go to Search", type="primary", use_container_width=True):
+                st.session_state.page = "Search"
+                st.session_state.processing_complete = False  # Reset the flag
+                st.rerun()
+        with col2:
+            if st.button("📄 Upload More", type="secondary", use_container_width=True):
+                st.session_state.processing_complete = False  # Reset the flag
+                st.rerun()
+
+    # Processing logic
+    elif uploaded_files and not st.session_state.processing:
         st.success(f"📄 {len(uploaded_files)} file(s) ready to process")
         if st.button("🚀 Process Documents", type="primary", use_container_width=True):
             st.session_state.processing = True
+            st.session_state.processing_complete = False
             progress = SmoothProgress(label="Analyzing documents…")
 
             try:
@@ -494,26 +514,17 @@ async def upload_page():
                 progress.finalize("Completed")
 
                 st.session_state.uploaded_files = list({d["source"] for d in docs_to_add})
-
-                # Success UI
-                st.success("✅ Documents processed successfully!")
-                st.markdown(
-                    '<div class="success-badge">Index ready. You can now search your documents.</div>',
-                    unsafe_allow_html=True,
-                )
-
-                if st.button("🔍 Go to Search", type="primary", use_container_width=True):
-                    st.session_state.page = "Search"
-                    st.rerun()
+                st.session_state.processing_complete = True  # Set completion flag
 
             except Exception as e:
                 st.error(f"Error processing documents: {str(e)}")
             finally:
                 st.session_state.processing = False
+                st.rerun()  # Refresh to show the navigation buttons
 
     show_footer()
 
-async def search_page():
+def search_page():
     st.title("Document Search")
     st.markdown("Ask questions about your documents")
 
@@ -541,6 +552,8 @@ async def search_page():
             st.info("No relevant passages found. Try rephrasing your question.")
         else:
             st.markdown(f"### Found {len(results)} relevant passages")
+            
+            # FIX 2: Use a more reliable approach for explain buttons
             for i, r in enumerate(results, 1):
                 with st.container():
                     st.markdown(
@@ -556,32 +569,40 @@ async def search_page():
                         unsafe_allow_html=True,
                     )
 
-                    if st.button(f"🤖 Explain (Result {i})", key=f"explain_{i}"):
+                    # Create unique keys for each result
+                    explain_key = f"explain_{hash_text(query)}_{i}_{hash_text(r['text'][:50])}"
+                    
+                    if st.button(f"🤖 Explain (Result {i})", key=explain_key):
                         if not st.session_state.gemini_key:
                             st.error("⚠️ GEMINI_API_KEY not set. Add it to your environment or Streamlit secrets.")
                         else:
                             with st.spinner("Generating explanation…"):
-                                explanation = await generate_explanation(
+                                # Use synchronous function to avoid async issues
+                                explanation = generate_explanation_sync(
                                     query,
                                     r['text'],  # IMPORTANT: only the selected passage
                                     r['meta']['source'],
                                     r['meta']['page'],
                                     st.session_state.gemini_key,
                                 )
-                            st.markdown(
-                                f"""
-                                <div style="background:#071218; padding:1rem; border-radius:8px; margin-top:0.5rem; border-left: 4px solid #FF6B6B">
-                                    <p style="margin:0; color:#dfeefc;"><b>🤖 AI Explanation:</b> {explanation}</p>
-                                </div>
-                                """,
-                                unsafe_allow_html=True,
-                            )
-                            st.session_state.history.append({
-                                "query": query,
-                                "result": r,
-                                "explanation": explanation,
-                                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M"),
-                            })
+                            
+                            if explanation:
+                                st.markdown(
+                                    f"""
+                                    <div style="background:#071218; padding:1rem; border-radius:8px; margin-top:0.5rem; border-left: 4px solid #FF6B6B">
+                                        <p style="margin:0; color:#dfeefc;"><b>🤖 AI Explanation:</b> {explanation}</p>
+                                    </div>
+                                    """,
+                                    unsafe_allow_html=True,
+                                )
+                                
+                                # Add to history
+                                st.session_state.history.append({
+                                    "query": query,
+                                    "result": r,
+                                    "explanation": explanation,
+                                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                                })
 
         st.markdown("---")
         if st.button("📜 View History", type="primary", use_container_width=True):
@@ -651,7 +672,8 @@ def main():
         # Run async page
         asyncio.run(upload_page())
     elif st.session_state.page == "Search":
-        asyncio.run(search_page())
+        # Changed to synchronous for better button handling
+        search_page()
     elif st.session_state.page == "History":
         history_page()
 
